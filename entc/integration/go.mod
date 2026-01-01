@@ -4,8 +4,6 @@ go 1.24.11
 
 replace entgo.io/ent => ../../
 
-replace ariga.io/atlas => ../../../atlas
-
 require (
 	ariga.io/atlas v0.36.2-0.20250730182955-2c6300d0a3e1
 	ariga.io/atlas-go-sdk v0.6.9
