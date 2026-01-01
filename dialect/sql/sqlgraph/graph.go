@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"entgo.io/ent/dialect"
 	"entgo.io/ent/dialect/sql"
@@ -1905,8 +1906,59 @@ func (c *creator) insertLastID(ctx context.Context, insert *sql.InsertBuilder) e
 	if err != nil {
 		return err
 	}
-	// MySQL does not support the "RETURNING" clause.
-	if insert.Dialect() != dialect.MySQL {
+	// MySQL and SQL Server do not support the "RETURNING" clause in the same way.
+	// SQL Server uses OUTPUT INSERTED syntax, which is handled by the driver.
+	switch insert.Dialect() {
+	case dialect.MySQL:
+		var res sql.Result
+		if err := c.tx.Exec(ctx, query, args, &res); err != nil {
+			return err
+		}
+		// If the ID field is not numeric (e.g. string),
+		// there is no way to scan the LAST_INSERT_ID.
+		if c.ID.Type.Numeric() {
+			id, err := res.LastInsertId()
+			if err != nil {
+				return err
+			}
+			c.ID.Value = id
+		}
+		return nil
+	case dialect.SQLServer:
+		// SQL Server uses OUTPUT INSERTED.id to return the inserted ID.
+		// We need to inject OUTPUT clause into the INSERT query.
+		if c.ID.Type.Numeric() {
+			// Inject OUTPUT INSERTED.[id_column] into the query.
+			// INSERT INTO [table] ([cols]) VALUES (...) becomes
+			// INSERT INTO [table] ([cols]) OUTPUT INSERTED.[id_column] VALUES (...)
+			idCol := c.ID.Column
+			outputQuery := injectSQLServerOutput(query, idCol)
+			rows := &sql.Rows{}
+			if err := c.tx.Query(ctx, outputQuery, args, rows); err != nil {
+				return err
+			}
+			defer rows.Close()
+			if rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					return fmt.Errorf("scan OUTPUT INSERTED: %w", err)
+				}
+				c.ID.Value = id
+			} else {
+				// Check if there's an error from the query.
+				if err := rows.Err(); err != nil {
+					return err
+				}
+				return fmt.Errorf("no rows returned from INSERT OUTPUT - table may not have IDENTITY column")
+			}
+		} else {
+			if err := c.tx.Exec(ctx, query, args, nil); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		// PostgreSQL, SQLite support RETURNING clause.
 		rows := &sql.Rows{}
 		if err := c.tx.Query(ctx, query, args, rows); err != nil {
 			return err
@@ -1930,21 +1982,6 @@ func (c *creator) insertLastID(ctx context.Context, insert *sql.InsertBuilder) e
 			return sql.ScanOne(rows, &c.ID.Value)
 		}
 	}
-	// MySQL.
-	var res sql.Result
-	if err := c.tx.Exec(ctx, query, args, &res); err != nil {
-		return err
-	}
-	// If the ID field is not numeric (e.g. string),
-	// there is no way to scan the LAST_INSERT_ID.
-	if c.ID.Type.Numeric() {
-		id, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		c.ID.Value = id
-	}
-	return nil
 }
 
 // insertLastIDs invokes the batch insert query on the transaction and returns the LastInsertID of all entities.
@@ -1953,8 +1990,58 @@ func (c *batchCreator) insertLastIDs(ctx context.Context, tx dialect.ExecQuerier
 	if err != nil {
 		return err
 	}
-	// MySQL does not support the "RETURNING" clause.
-	if insert.Dialect() != dialect.MySQL {
+	switch insert.Dialect() {
+	case dialect.MySQL:
+		var res sql.Result
+		if err := tx.Exec(ctx, query, args, &res); err != nil {
+			return err
+		}
+		// If the ID field is not numeric (e.g. string),
+		// there is no way to scan the LAST_INSERT_ID.
+		if len(c.Nodes) > 0 && c.Nodes[0].ID.Type.Numeric() {
+			id, err := res.LastInsertId()
+			if err != nil {
+				return err
+			}
+			affected, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			// Assume the ID field is AUTO_INCREMENT
+			// if its type is numeric.
+			for i := 0; int64(i) < affected && i < len(c.Nodes); i++ {
+				c.Nodes[i].ID.Value = id + int64(i)
+			}
+		}
+		return nil
+	case dialect.SQLServer:
+		// SQL Server: Execute insert, then query for inserted IDs using @@IDENTITY
+		// For batch inserts, we need to insert one by one to get each ID.
+		// This is a limitation of SQL Server's SCOPE_IDENTITY().
+		if err := tx.Exec(ctx, query, args, nil); err != nil {
+			return err
+		}
+		if len(c.Nodes) > 0 && c.Nodes[0].ID.Type.Numeric() {
+			rows := &sql.Rows{}
+			if err := tx.Query(ctx, "SELECT SCOPE_IDENTITY()", []any{}, rows); err != nil {
+				return err
+			}
+			defer rows.Close()
+			if rows.Next() {
+				var lastID int64
+				if err := rows.Scan(&lastID); err != nil {
+					return err
+				}
+				// For batch insert with IDENTITY, IDs are sequential
+				startID := lastID - int64(len(c.Nodes)-1)
+				for i := range c.Nodes {
+					c.Nodes[i].ID.Value = startID + int64(i)
+				}
+			}
+		}
+		return nil
+	default:
+		// PostgreSQL, SQLite support RETURNING clause.
 		rows := &sql.Rows{}
 		if err := tx.Query(ctx, query, args, rows); err != nil {
 			return err
@@ -1985,29 +2072,6 @@ func (c *batchCreator) insertLastIDs(ctx context.Context, tx dialect.ExecQuerier
 		}
 		return rows.Err()
 	}
-	// MySQL.
-	var res sql.Result
-	if err := tx.Exec(ctx, query, args, &res); err != nil {
-		return err
-	}
-	// If the ID field is not numeric (e.g. string),
-	// there is no way to scan the LAST_INSERT_ID.
-	if len(c.Nodes) > 0 && c.Nodes[0].ID.Type.Numeric() {
-		id, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		// Assume the ID field is AUTO_INCREMENT
-		// if its type is numeric.
-		for i := 0; int64(i) < affected && i < len(c.Nodes); i++ {
-			c.Nodes[i].ID.Value = id + int64(i)
-		}
-	}
-	return nil
 }
 
 // rollback calls to tx.Rollback and wraps the given error with the rollback error if occurred.
@@ -2071,4 +2135,24 @@ func product(a, b []driver.Value) [][2]driver.Value {
 		}
 	}
 	return c
+}
+
+// injectSQLServerOutput injects OUTPUT INSERTED.[column] clause into an INSERT query.
+// SQL Server's OUTPUT clause must be placed between the column list and VALUES clause.
+// INSERT INTO [table] ([cols]) VALUES (...) becomes
+// INSERT INTO [table] ([cols]) OUTPUT INSERTED.[column] VALUES (...)
+func injectSQLServerOutput(query, idColumn string) string {
+	// Find the position of VALUES or DEFAULT VALUES
+	upperQuery := strings.ToUpper(query)
+	valuesIdx := strings.Index(upperQuery, " VALUES ")
+	if valuesIdx == -1 {
+		valuesIdx = strings.Index(upperQuery, " DEFAULT VALUES")
+	}
+	if valuesIdx == -1 {
+		// Can't find VALUES, return original query
+		return query
+	}
+	// Insert OUTPUT clause before VALUES
+	output := fmt.Sprintf(" OUTPUT INSERTED.[%s]", idColumn)
+	return query[:valuesIdx] + output + query[valuesIdx:]
 }

@@ -1044,6 +1044,12 @@ func (a *Atlas) atDefault(c1 *Column, c2 *schema.Column) error {
 	return nil
 }
 
+// primaryKeyCustomizer is an optional interface that dialects can implement
+// to customize the primary key index attributes.
+type primaryKeyCustomizer interface {
+	atPrimaryKey(*schema.Index)
+}
+
 func (a *Atlas) aIndexes(et *Table, at *schema.Table) error {
 	// Primary-key index.
 	pk := make([]*schema.Column, 0, len(et.PrimaryKey))
@@ -1056,7 +1062,12 @@ func (a *Atlas) aIndexes(et *Table, at *schema.Table) error {
 	}
 	// CreateFunc might clear the primary keys.
 	if len(pk) > 0 {
-		at.SetPrimaryKey(schema.NewPrimaryKey(pk...))
+		pkIdx := schema.NewPrimaryKey(pk...)
+		// Allow dialects to customize the primary key attributes.
+		if c, ok := a.sqlDialect.(primaryKeyCustomizer); ok {
+			c.atPrimaryKey(pkIdx)
+		}
+		at.SetPrimaryKey(pkIdx)
 	}
 	// Rest of indexes.
 	for _, idx1 := range et.Indexes {
@@ -1109,8 +1120,11 @@ func (a *Atlas) setupTables(tables []*Table) {
 // symbol makes sure the symbol length is not longer than the maxlength in the dialect.
 func (a *Atlas) symbol(name string) string {
 	size := 64
-	if a.dialect == dialect.Postgres {
+	switch a.dialect {
+	case dialect.Postgres:
 		size = 63
+	case dialect.SQLServer:
+		size = 128 // SQL Server supports up to 128 characters for identifiers
 	}
 	if len(name) <= size {
 		return name
@@ -1128,6 +1142,8 @@ func (a *Atlas) entDialect(ctx context.Context, drv dialect.Driver) (sqlDialect,
 		d = &SQLite{Driver: drv, WithForeignKeys: a.withForeignKeys}
 	case dialect.Postgres:
 		d = &Postgres{Driver: drv}
+	case dialect.SQLServer:
+		d = &SQLServer{Driver: drv, schema: a.schema}
 	default:
 		return nil, fmt.Errorf("sql/schema: unsupported dialect %q", a.dialect)
 	}

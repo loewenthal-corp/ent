@@ -468,7 +468,7 @@ func (i *InsertBuilder) writeDefault(b *Builder) {
 	switch i.Dialect() {
 	case dialect.MySQL:
 		b.WriteString("VALUES ()")
-	case dialect.SQLite, dialect.Postgres:
+	case dialect.SQLite, dialect.Postgres, dialect.SQLServer:
 		b.WriteString("DEFAULT VALUES")
 	}
 }
@@ -482,6 +482,9 @@ func (i *InsertBuilder) writeConflict(b *Builder) {
 		if i.conflict.action.nothing {
 			i.OnConflict(ResolveWithIgnore())
 		}
+	case dialect.SQLServer:
+		b.AddError(errors.New("ON CONFLICT is not supported by SQL Server; use MERGE statement instead"))
+		return
 	case dialect.SQLite, dialect.Postgres:
 		b.WriteString(" ON CONFLICT")
 		switch t := i.conflict.target; {
@@ -842,7 +845,12 @@ func IsTrue(col string) *Predicate {
 // IsTrue appends a predicate that checks if the column value is truthy.
 func (p *Predicate) IsTrue(col string) *Predicate {
 	return p.Append(func(b *Builder) {
-		b.Ident(col)
+		// SQL Server doesn't support bare column name as boolean expression.
+		if b.sqlserver() {
+			b.Ident(col).WriteString(" = 1")
+		} else {
+			b.Ident(col)
+		}
 	})
 }
 
@@ -854,7 +862,12 @@ func IsFalse(col string) *Predicate {
 // IsFalse appends a predicate that checks if the column value is falsey.
 func (p *Predicate) IsFalse(col string) *Predicate {
 	return p.Append(func(b *Builder) {
-		b.WriteString("NOT ").Ident(col)
+		// SQL Server doesn't support bare column name as boolean expression.
+		if b.sqlserver() {
+			b.Ident(col).WriteString(" = 0")
+		} else {
+			b.WriteString("NOT ").Ident(col)
+		}
 	})
 }
 
@@ -2285,7 +2298,7 @@ func (s *Selector) As(alias string) *Selector {
 func (s *Selector) Count(columns ...string) *Selector {
 	column := "*"
 	if len(columns) > 0 {
-		b := &Builder{}
+		b := &Builder{dialect: s.dialect}
 		b.IdentComma(columns...)
 		column = b.String()
 	}
@@ -2569,13 +2582,44 @@ func (s *Selector) Query() (string, []any) {
 		s.joinSetOps(&b)
 	}
 	joinOrder(s.order, &b)
-	if s.limit != nil {
-		b.WriteString(" LIMIT ")
-		b.WriteString(strconv.Itoa(*s.limit))
-	}
-	if s.offset != nil {
-		b.WriteString(" OFFSET ")
-		b.WriteString(strconv.Itoa(*s.offset))
+	// SQL Server uses OFFSET x ROWS FETCH NEXT y ROWS ONLY syntax
+	// which requires an ORDER BY clause.
+	if s.sqlserver() {
+		if s.limit != nil || s.offset != nil {
+			// SQL Server requires ORDER BY for OFFSET/FETCH.
+			// If no ORDER BY is specified, we add a dummy one.
+			if len(s.order) == 0 {
+				// When using DISTINCT, ORDER BY columns must appear in the SELECT list.
+				// Use the first column from the selection, or fall back to (SELECT NULL).
+				if s.distinct && len(s.selection) > 0 && s.selection[0].c != "" {
+					b.WriteString(" ORDER BY ")
+					b.WriteString(s.selection[0].c)
+				} else {
+					b.WriteString(" ORDER BY (SELECT NULL)")
+				}
+			}
+			offset := 0
+			if s.offset != nil {
+				offset = *s.offset
+			}
+			b.WriteString(" OFFSET ")
+			b.WriteString(strconv.Itoa(offset))
+			b.WriteString(" ROWS")
+			if s.limit != nil {
+				b.WriteString(" FETCH NEXT ")
+				b.WriteString(strconv.Itoa(*s.limit))
+				b.WriteString(" ROWS ONLY")
+			}
+		}
+	} else {
+		if s.limit != nil {
+			b.WriteString(" LIMIT ")
+			b.WriteString(strconv.Itoa(*s.limit))
+		}
+		if s.offset != nil {
+			b.WriteString(" OFFSET ")
+			b.WriteString(strconv.Itoa(*s.offset))
+		}
 	}
 	s.joinLock(&b)
 	s.total = b.total
@@ -2971,6 +3015,14 @@ func (b *Builder) Quote(ident string) string {
 			return strings.ReplaceAll(ident, "`", `"`)
 		}
 		quote = `"`
+	case b.sqlserver():
+		// SQL Server uses [brackets] for quoting identifiers.
+		if strings.Contains(ident, "`") {
+			ident = strings.ReplaceAll(ident, "`", "")
+		}
+		// Escape existing ] by doubling it.
+		ident = strings.ReplaceAll(ident, "]", "]]")
+		return "[" + ident + "]"
 	// An identifier for unknown dialect.
 	case b.dialect == "" && strings.ContainsAny(ident, "`\""):
 		return ident
@@ -3173,10 +3225,15 @@ func (b *Builder) Arg(a any) *Builder {
 	}
 	// Default placeholder param (MySQL and SQLite).
 	format := "?"
-	if b.postgres() {
+	switch {
+	case b.postgres():
 		// Postgres' arguments are referenced using the syntax $n.
 		// $1 refers to the 1st argument, $2 to the 2nd, and so on.
 		format = "$" + strconv.Itoa(b.total+1)
+	case b.sqlserver():
+		// SQL Server's arguments are referenced using the syntax @pN.
+		// @p1 refers to the 1st argument, @p2 to the 2nd, and so on.
+		format = "@p" + strconv.Itoa(b.total+1)
 	}
 	if f, ok := a.(ParamFormatter); ok {
 		format = f.FormatParam(format, &StmtInfo{
@@ -3331,6 +3388,11 @@ func (b Builder) sqlite() bool {
 	return b.Dialect() == dialect.SQLite
 }
 
+// sqlserver reports if the builder dialect is SQL Server.
+func (b Builder) sqlserver() bool {
+	return b.Dialect() == dialect.SQLServer
+}
+
 // fromIdent sets the builder dialect from the identifier format.
 func (b *Builder) fromIdent(ident string) {
 	if strings.Contains(ident, `"`) {
@@ -3344,6 +3406,13 @@ func (b *Builder) isIdent(s string) bool {
 	switch {
 	case b.postgres():
 		return strings.Contains(s, `"`)
+	case b.sqlserver():
+		return strings.Contains(s, "[") && strings.Contains(s, "]")
+	case b.dialect == "":
+		// Unknown dialect: check for any quoting style.
+		return strings.Contains(s, "`") ||
+			strings.Contains(s, `"`) ||
+			(strings.Contains(s, "[") && strings.Contains(s, "]"))
 	default:
 		return strings.Contains(s, "`")
 	}
@@ -3351,9 +3420,15 @@ func (b *Builder) isIdent(s string) bool {
 
 // unquote database identifiers.
 func (b *Builder) unquote(s string) string {
-	switch pg := b.postgres(); {
+	switch {
 	case len(s) < 2:
-	case !pg && s[0] == '`' && s[len(s)-1] == '`', pg && s[0] == '"' && s[len(s)-1] == '"':
+	case b.postgres() && s[0] == '"' && s[len(s)-1] == '"':
+		if u, err := strconv.Unquote(s); err == nil {
+			return u
+		}
+	case b.sqlserver() && s[0] == '[' && s[len(s)-1] == ']':
+		return strings.ReplaceAll(s[1:len(s)-1], "]]", "]")
+	case s[0] == '`' && s[len(s)-1] == '`':
 		if u, err := strconv.Unquote(s); err == nil {
 			return u
 		}
@@ -3363,10 +3438,11 @@ func (b *Builder) unquote(s string) string {
 
 // isQualified reports if the given string is a qualified identifier.
 func (b *Builder) isQualified(s string) bool {
-	ident, pg := b.isIdent(s), b.postgres()
+	ident, pg, ss := b.isIdent(s), b.postgres(), b.sqlserver()
 	return !ident && len(s) > 2 && strings.ContainsRune(s[1:len(s)-1], '.') || // <qualifier>.<column>
 		ident && pg && strings.Contains(s, `"."`) || // "qualifier"."column"
-		ident && !pg && strings.Contains(s, "`.`") // `qualifier`.`column`
+		ident && ss && strings.Contains(s, "].[") || // [qualifier].[column]
+		ident && !pg && !ss && strings.Contains(s, "`.`") // `qualifier`.`column`
 }
 
 // state wraps all methods for setting and getting
